@@ -1,9 +1,9 @@
 use anyhow::Result;
-use sysinfo::{DiskExt, CpuExt, System, SystemExt};
+use sysinfo::{System, Disks};
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
 use log::{debug, info};
-use crate::model::{SystemInfo, Processor, Disk, GraphicCard, GraphicsUsage, GraphicsProcessUtilization, SystemStatus, Process, Camera, NvidiaInfo};
+use crate::model::{SystemInfo, Processor, Disk as DiskModel, GraphicCard, GraphicsUsage, GraphicsProcessUtilization, SystemStatus, Process, Camera, NvidiaInfo};
 use crate::monitor::Monitor;
 use std::path::Path;
 
@@ -55,57 +55,155 @@ impl Machine {
     /// println!("{:?}", m.system_info())
     /// ```
     pub fn system_info(& mut self) -> SystemInfo {
-        let sys = System::new_all();
-        //let mut processors = Vec::new();
-        let processor = sys.global_cpu_info();
-        let processor = Processor{
-            frequency: processor.frequency(),
-            vendor: processor.vendor_id().to_string(),
-            brand: processor.brand().to_string()
+        let mut sys = System::new();
+        sys.refresh_all();
+        
+        // Get CPU info - in sysinfo 0.37, we use cpus() to get all CPUs
+        let cpus = sys.cpus();
+        let processor = if let Some(cpu) = cpus.first() {
+            Processor{
+                frequency: cpu.frequency(),
+                vendor: cpu.vendor_id().to_string(),
+                brand: cpu.brand().to_string()
+            }
+        } else {
+            Processor{
+                frequency: 0,
+                vendor: "Unknown".to_string(),
+                brand: "Unknown".to_string()
+            }
         };
 
-
+        // Get disks using Disks struct
+        let disks_list = Disks::new_with_refreshed_list();
         let mut disks = Vec::new();
-        for disk in sys.disks() {
-            disks.push(Disk{
-                name: disk.name().to_str().unwrap().to_string(),
-                fs: String::from_utf8(disk.file_system().to_vec()).unwrap(),
-                storage_type: match disk.type_() {
-                    sysinfo::DiskType::HDD => "HDD".to_string(),
-                    sysinfo::DiskType::SSD => "SSD".to_string(),
+        for disk in disks_list.list() {
+            // Handle potential errors when converting disk names and file systems
+            let disk_name = disk.name().to_str().unwrap_or("Unknown").to_string();
+            let fs = disk.file_system().to_string_lossy().to_string();
+            let mount_point = disk.mount_point().to_str().unwrap_or("Unknown").to_string();
+            
+            disks.push(DiskModel{
+                name: disk_name,
+                fs,
+                storage_type: match disk.kind() {
+                    sysinfo::DiskKind::HDD => "HDD".to_string(),
+                    sysinfo::DiskKind::SSD => "SSD".to_string(),
                     _ => "Unknown".to_string()
                 },
                 available: disk.available_space(),
                 size: disk.total_space(),
-                mount_point: disk.mount_point().to_str().unwrap().to_string()
+                mount_point
             })
         }
 
         let mut cards = Vec::new();
         let nvidia = if let Some(nvml) = &self.nvml {
-            for n in 0..nvml.device_count().unwrap() {
-                let device = nvml.device_by_index(n).unwrap();
-                cards.push(GraphicCard{
-                    id: device.uuid().unwrap(),
-                    name: device.name().unwrap(),
-                    brand: match device.brand().unwrap() {
+            // Handle device_count() error
+            let device_count = match nvml.device_count() {
+                Ok(count) => count,
+                Err(e) => {
+                    debug!("Failed to get NVIDIA device count: {}", e);
+                    0
+                }
+            };
+            
+            for n in 0..device_count {
+                // Handle device_by_index() error
+                let device = match nvml.device_by_index(n) {
+                    Ok(dev) => dev,
+                    Err(e) => {
+                        debug!("Failed to get NVIDIA device at index {}: {}", n, e);
+                        continue;
+                    }
+                };
+                
+                // Handle brand() error gracefully - it may return UnexpectedVariant for new GPU brands
+                // The error can occur when NVML returns a brand value that isn't in the enum yet
+                let brand_str = match device.brand() {
+                    Ok(brand) => match brand {
                         nvml_wrapper::enum_wrappers::device::Brand::GeForce => "GeForce".to_string(),
                         nvml_wrapper::enum_wrappers::device::Brand::Quadro => "Quadro".to_string(),
                         nvml_wrapper::enum_wrappers::device::Brand::Tesla => "Tesla".to_string(),
                         nvml_wrapper::enum_wrappers::device::Brand::Titan => "Titan".to_string(),
                         nvml_wrapper::enum_wrappers::device::Brand::NVS => "NVS".to_string(),
                         nvml_wrapper::enum_wrappers::device::Brand::GRID => "GRID".to_string(),
+                        nvml_wrapper::enum_wrappers::device::Brand::VApps => "VApps".to_string(),
+                        nvml_wrapper::enum_wrappers::device::Brand::VPC => "VPC".to_string(),
+                        nvml_wrapper::enum_wrappers::device::Brand::VCS => "VCS".to_string(),
+                        nvml_wrapper::enum_wrappers::device::Brand::VWS => "VWS".to_string(),
+                        nvml_wrapper::enum_wrappers::device::Brand::CloudGaming => "CloudGaming".to_string(),
                         nvml_wrapper::enum_wrappers::device::Brand::Unknown => "Unknown".to_string(),
+                        // Handle any future brand variants
+                        _ => format!("{:?}", brand),
                     },
-                    memory: device.memory_info().unwrap().total,
-                    temperature: device.temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu).unwrap()
+                    Err(e) => {
+                        // This handles cases where NVML returns an unknown brand variant (e.g., variant 12)
+                        // which can happen with newer GPU models not yet in the enum
+                        debug!("Failed to get GPU brand (likely UnexpectedVariant): {}", e);
+                        format!("Unknown(Error: {})", e)
+                    }
+                };
+                
+                // Handle other device operations with error handling
+                let uuid = match device.uuid() {
+                    Ok(u) => u,
+                    Err(e) => {
+                        debug!("Failed to get GPU UUID: {}", e);
+                        continue;
+                    }
+                };
+                
+                let name = match device.name() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        debug!("Failed to get GPU name: {}", e);
+                        continue;
+                    }
+                };
+                
+                let memory = match device.memory_info() {
+                    Ok(m) => m.total,
+                    Err(e) => {
+                        debug!("Failed to get GPU memory info: {}", e);
+                        continue;
+                    }
+                };
+                
+                let temperature = match device.temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        debug!("Failed to get GPU temperature: {}", e);
+                        continue;
+                    }
+                };
+                
+                cards.push(GraphicCard{
+                    id: uuid,
+                    name,
+                    brand: brand_str,
+                    memory,
+                    temperature
                 });
             }
-            Some(NvidiaInfo {
-                driver_version: nvml.sys_driver_version().unwrap(),
-                nvml_version: nvml.sys_nvml_version().unwrap(),
-                cuda_version: nvml.sys_cuda_driver_version().unwrap()
-            })
+            
+            // Handle NvidiaInfo creation with error handling
+            let nvidia_info = match (
+                nvml.sys_driver_version(),
+                nvml.sys_nvml_version(),
+                nvml.sys_cuda_driver_version()
+            ) {
+                (Ok(driver), Ok(nvml_ver), Ok(cuda)) => Some(NvidiaInfo {
+                    driver_version: driver,
+                    nvml_version: nvml_ver,
+                    cuda_version: cuda
+                }),
+                _ => {
+                    debug!("Failed to get some NVIDIA system info");
+                    None
+                }
+            };
+            nvidia_info
         } else {
             None
         };
@@ -113,7 +211,12 @@ impl Machine {
         // Getting the model
         let model_path = Path::new("/sys/firmware/devicetree/base/model");
         let model = if model_path.exists() {
-            Some(std::fs::read_to_string(model_path).unwrap())
+            std::fs::read_to_string(model_path)
+                .map_err(|e| {
+                    debug!("Failed to read model path: {}", e);
+                    e
+                })
+                .ok()
         } else {
             None
         };
@@ -121,11 +224,11 @@ impl Machine {
         let vaapi = Path::new("/dev/dri/renderD128").exists();
 
         SystemInfo {
-            os_name: sys.name().unwrap(),
-            kernel_version: sys.kernel_version().unwrap(),
-            os_version: sys.os_version().unwrap(),
-            distribution: sys.distribution_id(),
-            hostname: sys.host_name().unwrap(),
+            os_name: System::name().unwrap_or_else(|| "Unknown".to_string()),
+            kernel_version: System::kernel_version().unwrap_or_else(|| "Unknown".to_string()),
+            os_version: System::os_version().unwrap_or_else(|| "Unknown".to_string()),
+            distribution: System::distribution_id(),
+            hostname: System::host_name().unwrap_or_else(|| "Unknown".to_string()),
             memory: sys.total_memory(),
             nvidia,
             vaapi,
@@ -158,12 +261,29 @@ impl Machine {
     pub fn graphics_status(&self) -> Vec<GraphicsUsage> {
         let mut cards = Vec::new();
         if let Some(nvml) = &self.nvml {
-            for n in 0..nvml.device_count().unwrap() {
-                let device = nvml.device_by_index(n).unwrap();
+            // Handle device_count() error
+            let device_count = match nvml.device_count() {
+                Ok(count) => count,
+                Err(e) => {
+                    debug!("Failed to get NVIDIA device count in graphics_status: {}", e);
+                    return cards;
+                }
+            };
+            
+            for n in 0..device_count {
+                // Handle device_by_index() error
+                let device = match nvml.device_by_index(n) {
+                    Ok(dev) => dev,
+                    Err(e) => {
+                        debug!("Failed to get NVIDIA device at index {} in graphics_status: {}", n, e);
+                        continue;
+                    }
+                };
+                
                 let mut processes = Vec::new();
                 let stats = device.process_utilization_stats(None);
-                if stats.is_ok() {
-                    for p in stats.unwrap() {
+                if let Ok(stats) = stats {
+                    for p in stats {
                         processes.push(GraphicsProcessUtilization{
                             pid: p.pid,
                             gpu: p.sm_util,
@@ -174,14 +294,63 @@ impl Machine {
                     }
                 }
     
+                // Handle all device operations with error handling
+                let uuid = match device.uuid() {
+                    Ok(u) => u,
+                    Err(e) => {
+                        debug!("Failed to get GPU UUID in graphics_status: {}", e);
+                        continue;
+                    }
+                };
+                
+                let memory_info = match device.memory_info() {
+                    Ok(m) => m.used,
+                    Err(e) => {
+                        debug!("Failed to get GPU memory info in graphics_status: {}", e);
+                        continue;
+                    }
+                };
+                
+                let encoder = match device.encoder_utilization() {
+                    Ok(e) => e.utilization,
+                    Err(e) => {
+                        debug!("Failed to get GPU encoder utilization: {}", e);
+                        continue;
+                    }
+                };
+                
+                let decoder = match device.decoder_utilization() {
+                    Ok(d) => d.utilization,
+                    Err(e) => {
+                        debug!("Failed to get GPU decoder utilization: {}", e);
+                        continue;
+                    }
+                };
+                
+                let utilization_rates = match device.utilization_rates() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        debug!("Failed to get GPU utilization rates: {}", e);
+                        continue;
+                    }
+                };
+                
+                let temperature = match device.temperature(TemperatureSensor::Gpu) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        debug!("Failed to get GPU temperature in graphics_status: {}", e);
+                        continue;
+                    }
+                };
+                
                 cards.push(GraphicsUsage {
-                    id: device.uuid().unwrap(),
-                    memory_used: device.memory_info().unwrap().used,
-                    encoder: device.encoder_utilization().unwrap().utilization,
-                    decoder: device.decoder_utilization().unwrap().utilization,
-                    gpu: device.utilization_rates().unwrap().gpu,
-                    memory_usage: device.utilization_rates().unwrap().memory,
-                    temperature: device.temperature(TemperatureSensor::Gpu).unwrap(),
+                    id: uuid,
+                    memory_used: memory_info,
+                    encoder,
+                    decoder,
+                    gpu: utilization_rates.gpu,
+                    memory_usage: utilization_rates.memory,
+                    temperature,
                     processes
                 });
             }

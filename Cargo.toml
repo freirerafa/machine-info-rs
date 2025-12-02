@@ -13,11 +13,11 @@ keywords = ["monitor", "nvidia", "gpu", "cpu", "memory"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
-sysinfo = {version = "0.26.4", default-features = false} # Disable multithread
-nvml-wrapper = "0.8.0"
+sysinfo = {version = "0.37.2", default-features = false, features = ["system", "disk"]} # Disable multithread but enable system, disk
+nvml-wrapper = "0.11.0"
 anyhow = "1.0"
 log = "0.4"
-v4l = { version = "0.13.0", optional = true}
+v4l = { version = "0.14.0", optional = true}
 
 
 [features]

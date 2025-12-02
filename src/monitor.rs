@@ -76,9 +76,14 @@ struct Cpu {
 
 impl Cpu {
     pub fn from_file(file: impl std::io::Read) -> Result<Cpu> {
-        let line = io::BufReader::new(file).lines().next().unwrap()?;
+        let mut lines = io::BufReader::new(file).lines();
+        let line = lines.next()
+            .ok_or_else(|| anyhow::anyhow!("No lines found in /proc/stat"))??;
         let re = line.split(" ").collect::<Vec<&str>>();
-        Ok(Cpu{values: re[2..].iter().map(|&e| e.parse::<u64>().unwrap()).collect::<Vec<u64>>()})
+        let values: Result<Vec<u64>, _> = re[2..].iter()
+            .map(|&e| e.parse::<u64>().map_err(|e| anyhow::anyhow!("Failed to parse CPU value '{}': {}", e, e)))
+            .collect();
+        Ok(Cpu{values: values?})
     }
 
     pub fn usage(&self, last: &Cpu) -> i32 {
@@ -103,10 +108,24 @@ struct Process {
 
 impl Process {
     pub fn from_file(file: impl std::io::Read) -> Result<Process> {
-        let line = io::BufReader::new(file).lines().next().unwrap()?;
+        let mut lines = io::BufReader::new(file).lines();
+        let line = lines.next()
+            .ok_or_else(|| anyhow::anyhow!("No lines found in process stat file"))??;
         let params = line.split(" ").collect::<Vec<&str>>();
+        
+        // Ensure we have enough parameters before parsing
+        if params.len() < 18 {
+            return Err(anyhow::anyhow!("Process stat file has insufficient parameters (expected at least 18, got {})", params.len()));
+        }
+        
+        let total_time: i32 = params[13..18].iter()
+            .map(|e| e.parse::<i32>().map_err(|e| anyhow::anyhow!("Failed to parse process time value '{}': {}", e, e)))
+            .collect::<Result<Vec<i32>, _>>()?
+            .iter()
+            .sum();
+        
         Ok(Process{
-            total_time: params[13..18].iter().map(|e| e.parse::<i32>().unwrap()).sum(),
+            total_time,
             when: SystemTime::now()
         })
     }
